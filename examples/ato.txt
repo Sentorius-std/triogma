@@ -1,0 +1,25 @@
+title: Bug bounty cheatsheet - ATO / 2FA / client-side
+ATO
+  Password Reset
+    Host Header Injection
+    [note] Changing email from String to array and see if we could reset
+      pass email in the second one.
+      "email":["attacker@example.com",
+      "second@example.com"]
+  JWT Token
+    - None Header
+    - Cracking the secret with rockyou.txt
+    - Algorithm Confusion
+2FA Bypass
+  null or true
+    [note] Changing "otp=261378" or "code=261378" to:
+      otp=null, otp=false, otp=true
+      code=null, code=true, code=false
+  Client Side Manipulation
+    [note] When sending the 2fa request, intercept the response before
+      passing to browser, then modify it to be success or copy place
+      an already successful response, change the auth-token, then
+      pass it to browser.
+      Link: https://www.youtube.com/watch?v=W7COaikTXM4&t=413s
+XSS
+CSRF

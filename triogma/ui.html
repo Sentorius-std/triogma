@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>board editor</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --text:#e6e9ef; --muted:#8b94a7; --accent:#6366f1;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);
+    font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
+  #app{display:grid;grid-template-columns:1fr 288px;height:100%}
+  #stage{position:relative;overflow:auto;background:#f8f9fb}
+  svg{display:block}
+
+  /* ---- top toolbar ---- */
+  #bar{position:absolute;top:14px;left:14px;z-index:10;display:flex;gap:6px;
+    background:rgba(23,26,33,.94);border:1px solid var(--line);border-radius:12px;
+    padding:7px;backdrop-filter:blur(8px);box-shadow:0 8px 26px rgba(0,0,0,.35)}
+  #bar button{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+    padding:7px 12px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:500}
+  #bar button:hover{background:#252a35;border-color:#39404e}
+  #bar button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  #bar .sep{width:1px;background:var(--line);margin:2px 4px}
+  #bar #status{font-size:12px;color:var(--muted);align-self:center;padding:0 8px}
+
+  /* ---- inspector ---- */
+  #side{background:var(--panel);border-left:1px solid var(--line);overflow-y:auto;
+    display:flex;flex-direction:column;gap:14px;padding:16px}
+  #side h2{margin:0;font-size:11px;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--muted);font-weight:600}
+  .row{display:flex;flex-direction:column;gap:6px}
+  .row label{font-size:11px;color:var(--muted);font-weight:500}
+  textarea,input,select{width:100%;background:var(--panel2);border:1px solid var(--line);
+    color:var(--text);border-radius:8px;padding:9px 10px;font:inherit;font-size:13px;
+    resize:vertical}
+  textarea{min-height:96px;line-height:1.5}
+  input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent)}
+  .swatches{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
+  .sw{height:30px;border-radius:8px;border:2px solid transparent;cursor:pointer}
+  .sw:hover{transform:translateY(-1px)}
+  .sw.on{border-color:#fff;box-shadow:0 0 0 2px var(--accent)}
+  .empty{color:var(--muted);font-size:12px;line-height:1.6}
+  .hint{font-size:11px;color:var(--muted);line-height:1.6;
+    border-top:1px solid var(--line);padding-top:12px;margin-top:auto}
+  kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;
+    padding:1px 5px;font-size:10px}
+  #del{background:#3a1d1d;border-color:#5b2a2a;color:#ffb4b4}
+  #del:hover{background:#4a2222}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="bar">
+      <button id="bBox">+ Box</button>
+      <button id="bNote">+ Note</button>
+      <div class="sep"></div>
+      <button id="bLink">Connect</button>
+      <div class="sep"></div>
+      <button id="bSave">Save</button>
+      <button id="bRender">Render PNG</button>
+      <button id="bExport">Export</button>
+      <span id="status">loading…</span>
+    </div>
+    <svg id="svg"><defs>
+      <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+        <path d="M24 0H0V24" fill="none" stroke="#e7eaef" stroke-width="1"/>
+      </pattern>
+    </defs><rect id="bg" width="100%" height="100%" fill="url(#grid)"/></svg>
+  </div>
+
+  <div id="side">
+    <h2>Inspector</h2>
+    <div id="insp"><div class="empty">Nothing selected.<br>Click a card to edit it.</div></div>
+    <div class="hint">
+      <b>Drag</b> a card to move it.<br>
+      <b>Double-click</b> to edit text.<br>
+      <b>Connect</b> then click two cards to link them.<br>
+      <kbd>Del</kbd> removes the selection.<br>
+      <kbd>Ctrl</kbd>+<kbd>S</kbd> saves.
+    </div>
+  </div>
+</div>
+
+<script>
+const ACCENTS = {root:"#4f46e5", box:"#2563eb", note:"#d97706", good:"#16a34a", bad:"#dc2626"};
+const PALETTE = ["#2563eb","#4f46e5","#d97706","#16a34a","#dc2626"];
+
+let board = {title:"Untitled board", nodes:[], edges:[]};
+let sel = null, linkFrom = null, dirty = false;
+let drag = null;
+
+const $ = (s) => document.querySelector(s);
+const svg = $("#svg"), stage = $("#stage"), status = $("#status");
+
+function setStatus(t){ status.textContent = t; }
+
+/* ---------------- geometry ---------------- */
+const NW = 210, NH = 54, PAD = 18, LINE = 18;
+function noteSize(n){
+  const cols = 44;
+  const lines = [];
+  String(n.label).split("\n").forEach(p=>{
+    let cur = "";
+    p.split(" ").forEach(w=>{
+      if ((cur+" "+w).trim().length <= cols || !cur) cur = (cur+" "+w).trim();
+      else { lines.push(cur); cur = w; }
+    });
+    lines.push(cur);
+  });
+  return {w:340, h:Math.max(46, lines.length*LINE + 26), lines};
+}
+function sizeOf(n){
+  if (n.kind === "note") return noteSize(n);
+  const lines = String(n.label).split("\n");
+  return {w:n.w||NW, h:n.h||NH, lines};
+}
+function nodeById(id){ return board.nodes.find(n=>n.id===id); }
+
+/* ---------------- render ---------------- */
+function render(){
+  const maxX = Math.max(900, ...board.nodes.map(n=>n.x+sizeOf(n).w+120));
+  const maxY = Math.max(600, ...board.nodes.map(n=>n.y+sizeOf(n).h+120));
+  svg.setAttribute("width", maxX);
+  svg.setAttribute("height", maxY);
+  $("#bg").setAttribute("width", maxX);
+  $("#bg").setAttribute("height", maxY);
+
+  [...svg.querySelectorAll("g.node,g.edge")].forEach(e=>e.remove());
+
+  // edges
+  board.edges.forEach(e=>{
+    const a = nodeById(e.from), b = nodeById(e.to);
+    if(!a||!b) return;
+    const sa = sizeOf(a), sb = sizeOf(b);
+    const x1 = a.x+sa.w, y1 = a.y+sa.h/2, x2 = b.x, y2 = b.y+sb.h/2;
+    const mx = x1 + (x2-x1)*0.45, r = 14, s = y2>y1?1:-1;
+    const d = Math.abs(y2-y1)<2
+      ? `M${x1} ${y1} L${x2} ${y2}`
+      : `M${x1} ${y1} L${mx-r} ${y1} Q${mx} ${y1} ${mx} ${y1+s*r}
+         L${mx} ${y2-s*r} Q${mx} ${y2} ${mx+r} ${y2} L${x2} ${y2}`;
+    const p = document.createElementNS("http://www.w3.org/2000/svg","path");
+    p.setAttribute("d", d); p.setAttribute("fill","none");
+    p.setAttribute("stroke","#94a3b8"); p.setAttribute("stroke-width","2");
+    p.setAttribute("class","edge");
+    svg.appendChild(p);
+  });
+
+  // nodes
+  board.nodes.forEach(n=>{
+    const s = sizeOf(n);
+    const g = document.createElementNS("http://www.w3.org/2000/svg","g");
+    g.setAttribute("class","node"); g.dataset.id = n.id;
+    g.style.cursor = "grab";
+
+    const rect = document.createElementNS("http://www.w3.org/2000/svg","rect");
+    rect.setAttribute("x",n.x); rect.setAttribute("y",n.y);
+    rect.setAttribute("width",s.w); rect.setAttribute("height",s.h);
+    rect.setAttribute("rx","10"); rect.setAttribute("fill","#ffffff");
+    rect.setAttribute("stroke", sel===n.id ? "#6366f1" : "#cbd5e1");
+    rect.setAttribute("stroke-width", sel===n.id ? "2.5" : "1.6");
+    if (n.kind !== "note"){
+      rect.setAttribute("filter","drop-shadow(0 2px 5px rgba(15,23,42,.10))");
+    }
+    g.appendChild(rect);
+
+    // accent rail
+    const rail = document.createElementNS("http://www.w3.org/2000/svg","rect");
+    rail.setAttribute("x",n.x+1); rail.setAttribute("y",n.y+1);
+    rail.setAttribute("width","5"); rail.setAttribute("height",s.h-2);
+    rail.setAttribute("rx","2.5");
+    rail.setAttribute("fill", n.color || ACCENTS[n.kind] || ACCENTS.box);
+    g.appendChild(rail);
+
+    const total = s.lines.length*LINE;
+    let cy = n.y + (s.h - total)/2;
+    s.lines.forEach((ln,i)=>{
+      const t = document.createElementNS("http://www.w3.org/2000/svg","text");
+      t.setAttribute("x", n.x + PAD + 12);
+      t.setAttribute("y", cy + i*LINE + 13);
+      t.setAttribute("font-size", n.kind==="note" ? "13" : "14");
+      t.setAttribute("fill", n.kind==="note" ? "#64748b" : "#17202e");
+      t.setAttribute("font-family","Inter,-apple-system,Segoe UI,sans-serif");
+      if (n.kind!=="note") t.setAttribute("font-weight","500");
+      t.textContent = ln;
+      g.appendChild(t);
+    });
+
+    g.addEventListener("mousedown", ev=>onDown(ev,n));
+    g.addEventListener("dblclick", ev=>{ ev.stopPropagation(); editText(n); });
+    svg.appendChild(g);
+  });
+}
+
+/* ---------------- interaction ---------------- */
+function onDown(ev,n){
+  ev.stopPropagation();
+  if (linkFrom){
+    if (linkFrom !== n.id) addEdge(linkFrom, n.id);
+    linkFrom = null; $("#bLink").classList.remove("on"); setStatus("saved? press Save");
+    render(); return;
+  }
+  sel = n.id; render(); inspect();
+  const pt = ptInSvg(ev);
+  drag = {id:n.id, dx: pt.x - n.x, dy: pt.y - n.y};
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+}
+function onMove(ev){
+  if(!drag) return;
+  const p = ptInSvg(ev);
+  const n = nodeById(drag.id); if(!n) return;
+  n.x = Math.round(p.x - drag.dx); n.y = Math.round(p.y - drag.dy);
+  render();
+}
+function onUp(){
+  if (drag) markDirty();
+  drag = null;
+  document.removeEventListener("mousemove", onMove);
+  document.removeEventListener("mouseup", onUp);
+}
+function ptInSvg(ev){
+  const r = svg.getBoundingClientRect();
+  return {x: ev.clientX - r.left, y: ev.clientY - r.top};
+}
+svg.addEventListener("mousedown", ()=>{ sel=null; linkFrom=null;
+  $("#bLink").classList.remove("on"); render(); inspect(); });
+
+/* ---------------- inspector ---------------- */
+function inspect(){
+  const box = $("#insp");
+  const n = sel ? nodeById(sel) : null;
+  if(!n){ box.innerHTML = '<div class="empty">Nothing selected.<br>Click a card to edit it.</div>'; return; }
+  box.innerHTML = `
+    <div class="row"><label>Text</label>
+      <textarea id="fLabel"></textarea></div>
+    <div class="row"><label>Type</label>
+      <select id="fKind">
+        ${["root","box","note","good","bad"].map(k=>
+          `<option value="${k}" ${n.kind===k?"selected":""}>${k}</option>`).join("")}
+      </select></div>
+    <div class="row"><label>Accent colour</label>
+      <div class="swatches" id="fSw">
+        ${PALETTE.map(c=>`<div class="sw ${((n.color||ACCENTS[n.kind])===c)?"on":""}"
+            data-c="${c}" style="background:${c}"></div>`).join("")}
+      </div></div>
+    <div class="row"><button id="del">Delete node</button></div>`;
+
+  const ta = $("#fLabel");
+  ta.value = n.label;
+  ta.addEventListener("input", ()=>{ n.label = ta.value; markDirty(); render(); });
+  $("#fKind").addEventListener("change", e=>{ n.kind=e.target.value; markDirty(); render(); inspect(); });
+  $("#fSw").addEventListener("click", e=>{
+    const c = e.target.dataset.c; if(!c) return;
+    n.color = c; markDirty(); render(); inspect();
+  });
+  $("#del").addEventListener("click", ()=>{ removeNode(n.id); });
+}
+
+/* ---------------- mutations ---------------- */
+function uid(){ return "n" + Math.random().toString(36).slice(2,9); }
+function nextPos(){
+  if(!board.nodes.length) return {x:120,y:140};
+  const last = board.nodes[board.nodes.length-1];
+  return {x:last.x, y:last.y + sizeOf(last).h + 28};
+}
+function addNode(kind, label){
+  const p = nextPos();
+  const n = {id:uid(), label: label || (kind==="note" ? "New note" : "New box"),
+             kind, x:p.x, y:p.y};
+  board.nodes.push(n); sel = n.id; markDirty(); render(); inspect();
+}
+function addEdge(a,b){
+  if(a===b) return;
+  if(board.edges.some(e=>e.from===a&&e.to===b)) return;
+  board.edges.push({from:a,to:b}); markDirty();
+}
+function removeNode(id){
+  board.nodes = board.nodes.filter(n=>n.id!==id);
+  board.edges = board.edges.filter(e=>e.from!==id&&e.to!==id);
+  sel=null; markDirty(); render(); inspect();
+}
+function editText(n){
+  const v = prompt("Card text (\\n for newline):", n.label);
+  if(v===null) return;
+  n.label = v.replace(/\\n/g,"\n"); markDirty(); render(); inspect();
+}
+function markDirty(){ dirty = true; setStatus("unsaved"); }
+
+/* ---------------- io ---------------- */
+async function load(){
+  try{
+    const r = await fetch("/api/board", {cache:"no-store"});
+    board = await r.json();
+    board.nodes ||= []; board.edges ||= [];
+    setStatus(board.nodes.length + " nodes");
+    render();
+  }catch(e){ setStatus("load failed"); }
+}
+async function save(){
+  try{
+    const r = await fetch("/api/board", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify(board)});
+    const j = await r.json();
+    setStatus(j.ok ? "saved ✓" : "save failed");
+    if(j.ok) dirty = false;
+  }catch(e){ setStatus("save failed"); }
+}
+async function renderPng(){
+  setStatus("rendering…");
+  await save();
+  try{
+    const r = await fetch("/api/render", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body:JSON.stringify(board)});
+    const j = await r.json();
+    setStatus(j.ok ? "PNG rendered ✓" : "render failed");
+  }catch(e){ setStatus("render failed"); }
+}
+function exportJson(){
+  const blob = new Blob([JSON.stringify(board,null,2)], {type:"application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "board.json"; a.click();
+}
+
+/* ---------------- wiring ---------------- */
+$("#bBox").onclick  = ()=>addNode("box");
+$("#bNote").onclick = ()=>addNode("note");
+$("#bLink").onclick = (e)=>{ linkFrom = null;
+  e.target.classList.toggle("on");
+  setStatus(e.target.classList.contains("on") ? "click two cards to link" : "");
+  if(e.target.classList.contains("on")) linkFrom = sel; };
+$("#bSave").onclick   = save;
+$("#bRender").onclick = renderPng;
+$("#bExport").onclick = exportJson;
+
+document.addEventListener("keydown", e=>{
+  if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="s"){ e.preventDefault(); save(); }
+  if((e.key==="Delete"||e.key==="Backspace") && sel &&
+     !/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName)){
+    e.preventDefault(); removeNode(sel);
+  }
+});
+window.addEventListener("beforeunload", e=>{
+  if(dirty){ e.preventDefault(); e.returnValue=""; }
+});
+
+load();
+</script>
+</body>
+</html>

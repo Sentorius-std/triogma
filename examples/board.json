@@ -1,0 +1,131 @@
+{
+  "title": "Bug bounty cheatsheet - ATO / 2FA / client-side",
+  "scheme": "pro",
+  "nodes": [
+    {
+      "id": "n1",
+      "label": "ATO",
+      "kind": "root"
+    },
+    {
+      "id": "n2",
+      "label": "Password Reset",
+      "kind": "box"
+    },
+    {
+      "id": "n3",
+      "label": "Host Header Injection",
+      "kind": "box"
+    },
+    {
+      "id": "n4",
+      "label": "Changing email from String to array and see if we could reset\npass email in the second one.\n\"email\":[\"attacker@example.com\",\n\"second@example.com\"]",
+      "kind": "note"
+    },
+    {
+      "id": "n5",
+      "label": "JWT Token",
+      "kind": "box"
+    },
+    {
+      "id": "n6",
+      "label": "None Header",
+      "kind": "box"
+    },
+    {
+      "id": "n7",
+      "label": "Cracking the secret with rockyou.txt",
+      "kind": "box"
+    },
+    {
+      "id": "n8",
+      "label": "Algorithm Confusion",
+      "kind": "box"
+    },
+    {
+      "id": "n9",
+      "label": "2FA Bypass",
+      "kind": "root"
+    },
+    {
+      "id": "n10",
+      "label": "null or true",
+      "kind": "box"
+    },
+    {
+      "id": "n11",
+      "label": "Changing \"otp=261378\" or \"code=261378\" to:\notp=null, otp=false, otp=true\ncode=null, code=true, code=false",
+      "kind": "note"
+    },
+    {
+      "id": "n12",
+      "label": "Client Side Manipulation",
+      "kind": "box"
+    },
+    {
+      "id": "n13",
+      "label": "When sending the 2fa request, intercept the response before\npassing to browser, then modify it to be success or copy place\nan already successful response, change the auth-token, then\npass it to browser.\nLink: https://www.youtube.com/watch?v=W7COaikTXM4&t=413s",
+      "kind": "note"
+    },
+    {
+      "id": "n14",
+      "label": "XSS",
+      "kind": "root"
+    },
+    {
+      "id": "n15",
+      "label": "CSRF",
+      "kind": "root"
+    }
+  ],
+  "edges": [
+    {
+      "from": "n1",
+      "to": "n2"
+    },
+    {
+      "from": "n2",
+      "to": "n3"
+    },
+    {
+      "from": "n2",
+      "to": "n4"
+    },
+    {
+      "from": "n1",
+      "to": "n5"
+    },
+    {
+      "from": "n5",
+      "to": "n6"
+    },
+    {
+      "from": "n5",
+      "to": "n7"
+    },
+    {
+      "from": "n5",
+      "to": "n8"
+    },
+    {
+      "from": "n9",
+      "to": "n10"
+    },
+    {
+      "from": "n10",
+      "to": "n11"
+    },
+    {
+      "from": "n9",
+      "to": "n12"
+    },
+    {
+      "from": "n12",
+      "to": "n13"
+    }
+  ],
+  "meta": {
+    "version": 1,
+    "app": "dsh-boards"
+  }
+}

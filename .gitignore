@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+board.json.tmp
+server.log
+.venv/
+venv/
+.DS_Store
