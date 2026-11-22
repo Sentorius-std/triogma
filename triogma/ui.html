@@ -12,8 +12,15 @@
   html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);
     font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif}
   #app{display:grid;grid-template-columns:1fr 288px;height:100%}
-  #stage{position:relative;overflow:auto;background:#f8f9fb}
+  #stage{position:relative;overflow:hidden;background:#f8f9fb}
+  /* Promote to a GPU layer ONLY while interacting. Persistent will-change on a
+     huge element makes Chrome eagerly rasterize the whole board, so every zoom
+     step re-rasters a giant texture (the lag). Transient promotion lets it tile
+     and rasterize lazily — only the visible region, at the current scale. */
+  #canvas{position:absolute;top:0;left:0;transform-origin:0 0}
+  #canvas.live{will-change:transform}
   svg{display:block}
+  #stage.panning{cursor:grabbing}
 
   /* ---- top toolbar ---- */
   #bar{position:absolute;top:14px;left:14px;z-index:10;display:flex;gap:6px;
@@ -23,6 +30,9 @@
     padding:7px 12px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:500}
   #bar button:hover{background:#252a35;border-color:#39404e}
   #bar button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  #bar select{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+    padding:7px 10px;border-radius:8px;font-size:12px;font-weight:600;max-width:240px;cursor:pointer}
+  #bar select:hover{border-color:#39404e}
   #bar .sep{width:1px;background:var(--line);margin:2px 4px}
   #bar #status{font-size:12px;color:var(--muted);align-self:center;padding:0 8px}
 
@@ -55,6 +65,8 @@
 <div id="app">
   <div id="stage">
     <div id="bar">
+      <select id="boardPicker" title="Choose a board"></select>
+      <div class="sep"></div>
       <button id="bBox">+ Box</button>
       <button id="bNote">+ Note</button>
       <div class="sep"></div>
@@ -63,24 +75,28 @@
       <button id="bSave">Save</button>
       <button id="bRender">Render PNG</button>
       <button id="bExport">Export</button>
+      <div class="sep"></div>
+      <button id="bFit">Fit</button>
+      <button id="bReset">100%</button>
       <span id="status">loading…</span>
     </div>
-    <svg id="svg"><defs>
+    <div id="canvas"><svg id="svg"><defs>
       <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
         <path d="M24 0H0V24" fill="none" stroke="#e7eaef" stroke-width="1"/>
       </pattern>
-    </defs><rect id="bg" width="100%" height="100%" fill="url(#grid)"/></svg>
+    </defs><rect id="bg" width="100%" height="100%" fill="url(#grid)"/></svg></div>
   </div>
 
   <div id="side">
     <h2>Inspector</h2>
     <div id="insp"><div class="empty">Nothing selected.<br>Click a card to edit it.</div></div>
     <div class="hint">
+      <b>Drag empty space</b> to pan · <b>scroll</b> to zoom.<br>
       <b>Drag</b> a card to move it.<br>
       <b>Double-click</b> to edit text.<br>
       <b>Connect</b> then click two cards to link them.<br>
       <kbd>Del</kbd> removes the selection.<br>
-      <kbd>Ctrl</kbd>+<kbd>S</kbd> saves.
+      <kbd>Ctrl</kbd>+<kbd>S</kbd> saves · <b>Fit</b> frames the board.
     </div>
   </div>
 </div>
@@ -94,16 +110,16 @@ let sel = null, linkFrom = null, dirty = false;
 let drag = null;
 
 const $ = (s) => document.querySelector(s);
-const svg = $("#svg"), stage = $("#stage"), status = $("#status");
+const svg = $("#svg"), stage = $("#stage"), status = $("#status"), canvas = $("#canvas");
 
 function setStatus(t){ status.textContent = t; }
 
 /* ---------------- geometry ---------------- */
 const NW = 210, NH = 54, PAD = 18, LINE = 18;
-function noteSize(n){
-  const cols = 44;
+// Word-wrap a label to a character budget, honouring explicit newlines.
+function wrapToChars(label, cols){
   const lines = [];
-  String(n.label).split("\n").forEach(p=>{
+  String(label).split("\n").forEach(p=>{
     let cur = "";
     p.split(" ").forEach(w=>{
       if ((cur+" "+w).trim().length <= cols || !cur) cur = (cur+" "+w).trim();
@@ -111,75 +127,137 @@ function noteSize(n){
     });
     lines.push(cur);
   });
+  return lines.length ? lines : [""];
+}
+function noteSize(n){
+  const lines = wrapToChars(n.label, 44);
   return {w:340, h:Math.max(46, lines.length*LINE + 26), lines};
 }
 function sizeOf(n){
   if (n.kind === "note") return noteSize(n);
-  const lines = String(n.label).split("\n");
-  return {w:n.w||NW, h:n.h||NH, lines};
+  // Keep the box at its laid-out width (columns stay aligned) but wrap the text
+  // to that width and grow the height so nothing spills past the rectangle.
+  const w = n.w || NW;
+  const cols = Math.max(6, Math.floor((w - 44) / 7.6));
+  const lines = wrapToChars(n.label, cols);
+  const h = Math.max(n.h || NH, lines.length*LINE + 24);
+  return {w, h, lines};
 }
 function nodeById(id){ return board.nodes.find(n=>n.id===id); }
 
-/* ---------------- render ---------------- */
+/* ---------------- view (pan / zoom via GPU CSS transform) ----------------
+   We move/scale the #canvas layer with a CSS transform instead of repainting the
+   SVG (viewBox). The board rasterizes once; panning is a single style write the
+   compositor handles on the GPU — no vector repaint per frame. x,y are screen px. */
+let view = {x:0, y:0, scale:1};
+function applyView(){
+  canvas.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
+}
+function contentBounds(){
+  let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
+  board.nodes.forEach(n=>{ const s=sizeOfCached(n);
+    minx=Math.min(minx,n.x); miny=Math.min(miny,n.y);
+    maxx=Math.max(maxx,n.x+s.w); maxy=Math.max(maxy,n.y+s.h); });
+  if(!isFinite(minx)) return {minx:0,miny:0,maxx:900,maxy:600};
+  return {minx,miny,maxx,maxy};
+}
+function frame(scale){             // place content top-left at a margin, at `scale`
+  const b = contentBounds(), pad = 40;
+  view.scale = scale;
+  view.x = pad - b.minx*scale;
+  view.y = pad - b.miny*scale;
+  applyView();
+}
+function fitView(){
+  const b = contentBounds(), pad = 40;
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const s = Math.max(0.1, Math.min((w-2*pad)/((b.maxx-b.minx)||1),
+                                   (h-2*pad)/((b.maxy-b.miny)||1), 1));
+  frame(s);
+}
+function initialView(){            // frame the full WIDTH, top-aligned; pan down to read
+  const b = contentBounds(), pad = 40;
+  const w = stage.clientWidth;
+  frame(Math.max(0.2, Math.min(1, (w-2*pad)/((b.maxx-b.minx)||1))));
+}
+function resetView(){ frame(1); }
+
+/* ---------------- render ----------------
+   Each node is a <g transform="translate(x,y)"> with LOCAL coords, so moving it
+   is one transform write (no DOM rebuild). Edges are indexed by node id so a drag
+   only re-paths the few connected edges. No SVG drop-shadow filters (they re-
+   rasterize every frame) — a flat offset rect fakes the shadow for ~free. */
+const NS = "http://www.w3.org/2000/svg";
+let nodeEls = {}, nodeRectEls = {}, edgeIndex = {};
+const sizeCache = new Map();
+function sizeOfCached(n){
+  const key = n.id+"|"+n.kind+"|"+(n.w||"")+"|"+(n.h||"")+"|"+n.label;
+  let s = sizeCache.get(key);
+  if(!s){ s = sizeOf(n); sizeCache.set(key, s); }
+  return s;
+}
+function edgeD(a,b){
+  const sa = sizeOfCached(a), sb = sizeOfCached(b);
+  const x1 = a.x+sa.w, y1 = a.y+sa.h/2, x2 = b.x, y2 = b.y+sb.h/2;
+  const mx = x1 + (x2-x1)*0.45, r = 14, s = y2>y1?1:-1;
+  return Math.abs(y2-y1)<2
+    ? `M${x1} ${y1} L${x2} ${y2}`
+    : `M${x1} ${y1} L${mx-r} ${y1} Q${mx} ${y1} ${mx} ${y1+s*r} L${mx} ${y2-s*r} Q${mx} ${y2} ${mx+r} ${y2} L${x2} ${y2}`;
+}
 function render(){
-  const maxX = Math.max(900, ...board.nodes.map(n=>n.x+sizeOf(n).w+120));
-  const maxY = Math.max(600, ...board.nodes.map(n=>n.y+sizeOf(n).h+120));
-  svg.setAttribute("width", maxX);
-  svg.setAttribute("height", maxY);
-  $("#bg").setAttribute("width", maxX);
-  $("#bg").setAttribute("height", maxY);
+  [...svg.querySelectorAll("g.node,g.edge,path.edge")].forEach(e=>e.remove());
+  nodeEls = {}; nodeRectEls = {}; edgeIndex = {}; sizeCache.clear();
 
-  [...svg.querySelectorAll("g.node,g.edge")].forEach(e=>e.remove());
-
-  // edges
+  // edges (under nodes), indexed by each endpoint for cheap drag updates
   board.edges.forEach(e=>{
     const a = nodeById(e.from), b = nodeById(e.to);
     if(!a||!b) return;
-    const sa = sizeOf(a), sb = sizeOf(b);
-    const x1 = a.x+sa.w, y1 = a.y+sa.h/2, x2 = b.x, y2 = b.y+sb.h/2;
-    const mx = x1 + (x2-x1)*0.45, r = 14, s = y2>y1?1:-1;
-    const d = Math.abs(y2-y1)<2
-      ? `M${x1} ${y1} L${x2} ${y2}`
-      : `M${x1} ${y1} L${mx-r} ${y1} Q${mx} ${y1} ${mx} ${y1+s*r}
-         L${mx} ${y2-s*r} Q${mx} ${y2} ${mx+r} ${y2} L${x2} ${y2}`;
-    const p = document.createElementNS("http://www.w3.org/2000/svg","path");
-    p.setAttribute("d", d); p.setAttribute("fill","none");
+    const p = document.createElementNS(NS,"path");
+    p.setAttribute("d", edgeD(a,b)); p.setAttribute("fill","none");
     p.setAttribute("stroke","#94a3b8"); p.setAttribute("stroke-width","2");
     p.setAttribute("class","edge");
     svg.appendChild(p);
+    const rec = {el:p, from:e.from, to:e.to};
+    (edgeIndex[e.from] ||= []).push(rec);
+    (edgeIndex[e.to]   ||= []).push(rec);
   });
 
-  // nodes
+  // nodes — positioned by group transform, drawn in local coords
   board.nodes.forEach(n=>{
-    const s = sizeOf(n);
-    const g = document.createElementNS("http://www.w3.org/2000/svg","g");
+    const s = sizeOfCached(n);
+    const g = document.createElementNS(NS,"g");
     g.setAttribute("class","node"); g.dataset.id = n.id;
+    g.setAttribute("transform",`translate(${n.x},${n.y})`);
     g.style.cursor = "grab";
 
-    const rect = document.createElementNS("http://www.w3.org/2000/svg","rect");
-    rect.setAttribute("x",n.x); rect.setAttribute("y",n.y);
+    if (n.kind !== "note"){            // flat shadow, no filter
+      const sh = document.createElementNS(NS,"rect");
+      sh.setAttribute("x",0); sh.setAttribute("y",2);
+      sh.setAttribute("width",s.w); sh.setAttribute("height",s.h);
+      sh.setAttribute("rx","10"); sh.setAttribute("fill","rgba(15,23,42,.07)");
+      g.appendChild(sh);
+    }
+    const rect = document.createElementNS(NS,"rect");
+    rect.setAttribute("x",0); rect.setAttribute("y",0);
     rect.setAttribute("width",s.w); rect.setAttribute("height",s.h);
     rect.setAttribute("rx","10"); rect.setAttribute("fill","#ffffff");
     rect.setAttribute("stroke", sel===n.id ? "#6366f1" : "#cbd5e1");
     rect.setAttribute("stroke-width", sel===n.id ? "2.5" : "1.6");
-    if (n.kind !== "note"){
-      rect.setAttribute("filter","drop-shadow(0 2px 5px rgba(15,23,42,.10))");
-    }
     g.appendChild(rect);
+    nodeRectEls[n.id] = rect;
 
-    // accent rail
-    const rail = document.createElementNS("http://www.w3.org/2000/svg","rect");
-    rail.setAttribute("x",n.x+1); rail.setAttribute("y",n.y+1);
+    const rail = document.createElementNS(NS,"rect");
+    rail.setAttribute("x",1); rail.setAttribute("y",1);
     rail.setAttribute("width","5"); rail.setAttribute("height",s.h-2);
     rail.setAttribute("rx","2.5");
     rail.setAttribute("fill", n.color || ACCENTS[n.kind] || ACCENTS.box);
     g.appendChild(rail);
 
     const total = s.lines.length*LINE;
-    let cy = n.y + (s.h - total)/2;
+    let cy = (s.h - total)/2;
     s.lines.forEach((ln,i)=>{
-      const t = document.createElementNS("http://www.w3.org/2000/svg","text");
-      t.setAttribute("x", n.x + PAD + 12);
+      const t = document.createElementNS(NS,"text");
+      t.setAttribute("x", PAD + 12);
       t.setAttribute("y", cy + i*LINE + 13);
       t.setAttribute("font-size", n.kind==="note" ? "13" : "14");
       t.setAttribute("fill", n.kind==="note" ? "#64748b" : "#17202e");
@@ -191,7 +269,33 @@ function render(){
 
     g.addEventListener("mousedown", ev=>onDown(ev,n));
     g.addEventListener("dblclick", ev=>{ ev.stopPropagation(); editText(n); });
+    nodeEls[n.id] = g;
     svg.appendChild(g);
+  });
+
+  // size the canvas layer (and its grid) to the content
+  const b = contentBounds();
+  const W = Math.max(900, b.maxx + 80), H = Math.max(600, b.maxy + 80);
+  svg.setAttribute("width", W);  svg.setAttribute("height", H);
+  const bg = $("#bg");
+  bg.setAttribute("x", 0); bg.setAttribute("y", 0);
+  bg.setAttribute("width", W); bg.setAttribute("height", H);
+}
+// cheap incremental updates (no DOM rebuild)
+function moveNode(n){
+  const g = nodeEls[n.id];
+  if(g) g.setAttribute("transform",`translate(${n.x},${n.y})`);
+  (edgeIndex[n.id]||[]).forEach(rec=>{
+    const a = nodeById(rec.from), b = nodeById(rec.to);
+    if(a&&b) rec.el.setAttribute("d", edgeD(a,b));
+  });
+}
+function setSelected(id){
+  const prev = sel; sel = id;
+  [prev, id].forEach(k=>{
+    const r = nodeRectEls[k]; if(!r) return;
+    r.setAttribute("stroke", sel===k ? "#6366f1" : "#cbd5e1");
+    r.setAttribute("stroke-width", sel===k ? "2.5" : "1.6");
   });
 }
 
@@ -203,31 +307,87 @@ function onDown(ev,n){
     linkFrom = null; $("#bLink").classList.remove("on"); setStatus("saved? press Save");
     render(); return;
   }
-  sel = n.id; render(); inspect();
+  setSelected(n.id); inspect();
   const pt = ptInSvg(ev);
-  drag = {id:n.id, dx: pt.x - n.x, dy: pt.y - n.y};
+  drag = {id:n.id, dx: pt.x - n.x, dy: pt.y - n.y, moved:false};
   document.addEventListener("mousemove", onMove);
   document.addEventListener("mouseup", onUp);
 }
+let dragRaf = false, dragPt = null;
 function onMove(ev){
   if(!drag) return;
-  const p = ptInSvg(ev);
-  const n = nodeById(drag.id); if(!n) return;
-  n.x = Math.round(p.x - drag.dx); n.y = Math.round(p.y - drag.dy);
-  render();
+  dragPt = ptInSvg(ev);
+  if(dragRaf) return;                 // coalesce to one update per frame
+  dragRaf = true;
+  requestAnimationFrame(()=>{
+    dragRaf = false;
+    if(!drag || !dragPt) return;
+    const n = nodeById(drag.id); if(!n) return;
+    n.x = Math.round(dragPt.x - drag.dx); n.y = Math.round(dragPt.y - drag.dy);
+    drag.moved = true;
+    moveNode(n);                       // transform + connected edges only
+  });
 }
 function onUp(){
-  if (drag) markDirty();
-  drag = null;
+  if (drag && drag.moved) markDirty();
+  drag = null; dragPt = null;
   document.removeEventListener("mousemove", onMove);
   document.removeEventListener("mouseup", onUp);
 }
 function ptInSvg(ev){
-  const r = svg.getBoundingClientRect();
-  return {x: ev.clientX - r.left, y: ev.clientY - r.top};
+  // Screen pixels -> board coordinates (inverse of the canvas CSS transform).
+  const r = stage.getBoundingClientRect();
+  return {x:(ev.clientX - r.left - view.x)/view.scale,
+          y:(ev.clientY - r.top  - view.y)/view.scale};
 }
-svg.addEventListener("mousedown", ()=>{ sel=null; linkFrom=null;
-  $("#bLink").classList.remove("on"); render(); inspect(); });
+
+/* ---- pan anywhere on the stage, wheel to zoom (Figma-style) ---- */
+let viewRaf = false, liveTimer = null;
+function markLive(){                      // GPU-promote the layer during interaction only
+  canvas.classList.add("live");
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(()=>canvas.classList.remove("live"), 260);
+}
+function scheduleView(){                  // coalesce high-frequency pan/zoom to one frame
+  markLive();
+  if(viewRaf) return;
+  viewRaf = true;
+  requestAnimationFrame(()=>{ viewRaf = false; applyView(); });
+}
+let pan = null;
+stage.addEventListener("mousedown", ev=>{
+  if(ev.target.closest("#bar")) return;          // don't pan when clicking the toolbar
+  linkFrom = null; $("#bLink").classList.remove("on");
+  setSelected(null); inspect();
+  pan = {cx:ev.clientX, cy:ev.clientY, vx:view.x, vy:view.y};
+  stage.classList.add("panning");
+  document.addEventListener("mousemove", onPan);
+  document.addEventListener("mouseup", endPan);
+});
+function onPan(ev){
+  if(!pan) return;
+  view.x = pan.vx + (ev.clientX - pan.cx);   // screen-px translate, applied directly
+  view.y = pan.vy + (ev.clientY - pan.cy);
+  scheduleView();
+}
+function endPan(){
+  pan = null; stage.classList.remove("panning");
+  document.removeEventListener("mousemove", onPan);
+  document.removeEventListener("mouseup", endPan);
+}
+stage.addEventListener("wheel", ev=>{
+  if(ev.target.closest("#bar")) return;
+  ev.preventDefault();
+  const r = stage.getBoundingClientRect();
+  const mx = ev.clientX - r.left, my = ev.clientY - r.top;         // cursor in stage px
+  const factor = ev.deltaY < 0 ? 1.1 : 1/1.1;
+  const s2 = Math.min(3, Math.max(0.1, view.scale*factor));
+  view.x = mx - (mx - view.x)/view.scale * s2;                     // keep board point under cursor
+  view.y = my - (my - view.y)/view.scale * s2;
+  view.scale = s2;
+  scheduleView();
+}, {passive:false});
+window.addEventListener("resize", scheduleView);
 
 /* ---------------- inspector ---------------- */
 function inspect(){
@@ -291,18 +451,48 @@ function editText(n){
 function markDirty(){ dirty = true; setStatus("unsaved"); }
 
 /* ---------------- io ---------------- */
-async function load(){
+let currentBoard = null;
+const picker = $("#boardPicker");
+
+async function loadBoards(){                 // populate the dropdown + open one
   try{
-    const r = await fetch("/api/board", {cache:"no-store"});
+    const data = await (await fetch("/api/boards", {cache:"no-store"})).json();
+    const boards = data.boards || [];
+    picker.innerHTML = boards.map(b=>
+      `<option value="${b.name}">${b.title||b.name}</option>`).join("");
+    const names = boards.map(b=>b.name);
+    const fromHash = decodeURIComponent((location.hash||"").replace(/^#/,""));
+    const initial = names.includes(fromHash) ? fromHash : (data.default || names[0]);
+    if(!initial){ setStatus("no boards found"); return; }
+    picker.value = initial;
+    await loadBoard(initial);
+  }catch(e){ setStatus("could not list boards"); }
+}
+async function loadBoard(name){
+  try{
+    setStatus("loading…");
+    const r = await fetch("/api/board?name="+encodeURIComponent(name), {cache:"no-store"});
     board = await r.json();
     board.nodes ||= []; board.edges ||= [];
+    currentBoard = name; dirty = false; sel = null; linkFrom = null;
+    if(location.hash.slice(1) !== name) location.hash = name;
+    document.title = (board.title || name) + " — board editor";
     setStatus(board.nodes.length + " nodes");
     render();
+    requestAnimationFrame(initialView);   // wait one frame so #stage has a size
+    inspect();
   }catch(e){ setStatus("load failed"); }
 }
+picker.addEventListener("change", e=>loadBoard(e.target.value));
+window.addEventListener("hashchange", ()=>{
+  const n = decodeURIComponent((location.hash||"").replace(/^#/,""));
+  if(n && n !== currentBoard){ picker.value = n; loadBoard(n); }
+});
+
 async function save(){
+  if(!currentBoard){ setStatus("no board selected"); return; }
   try{
-    const r = await fetch("/api/board", {method:"POST",
+    const r = await fetch("/api/board?name="+encodeURIComponent(currentBoard), {method:"POST",
       headers:{"Content-Type":"application/json"}, body:JSON.stringify(board)});
     const j = await r.json();
     setStatus(j.ok ? "saved ✓" : "save failed");
@@ -314,7 +504,8 @@ async function renderPng(){
   await save();
   try{
     const r = await fetch("/api/render", {method:"POST",
-      headers:{"Content-Type":"application/json"}, body:JSON.stringify(board)});
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name:currentBoard, board})});
     const j = await r.json();
     setStatus(j.ok ? "PNG rendered ✓" : "render failed");
   }catch(e){ setStatus("render failed"); }
@@ -336,6 +527,8 @@ $("#bLink").onclick = (e)=>{ linkFrom = null;
 $("#bSave").onclick   = save;
 $("#bRender").onclick = renderPng;
 $("#bExport").onclick = exportJson;
+$("#bFit").onclick    = fitView;
+$("#bReset").onclick  = resetView;
 
 document.addEventListener("keydown", e=>{
   if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="s"){ e.preventDefault(); save(); }
@@ -348,7 +541,7 @@ window.addEventListener("beforeunload", e=>{
   if(dirty){ e.preventDefault(); e.returnValue=""; }
 });
 
-load();
+loadBoards();
 </script>
 </body>
 </html>

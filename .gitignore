@@ -5,3 +5,7 @@ server.log
 .venv/
 venv/
 .DS_Store
+
+# Private methodology boards — kept out of the public repo
+methodology/
+methodology.zip
